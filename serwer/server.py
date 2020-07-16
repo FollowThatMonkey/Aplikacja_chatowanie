@@ -1,5 +1,6 @@
 import sqlite3
 import socket
+import queue
 import re
 import os
 import threading
@@ -8,6 +9,7 @@ import traceback
 
 DB_PATH = os.path.dirname(os.path.abspath(__file__)) + '/users.db'
 BUFF_SIZE = 1024
+QUEUE_SIZE = 1000
 ENCODING = 'utf-8'
 
 DB_ERROR = 1
@@ -16,16 +18,202 @@ KEYBOARD_ERROR = 3
 
 
 class Message:
-    def __init__(self):
-        pass
+    def __init__(self, msg_body: str, final_msg: bool = False):
+        self.msg_body = (msg_body + '\n').encode(ENCODING)
+        self.final_msg = final_msg
+
+    def get_body(self):
+        return self.msg_body
+
+    def is_final(self):
+        return self.final_msg
 
 
 class Client:
-    def __init__(self, client_sock: socket.socket, username: str):
+    HELP_MSG = "HELP".encode(ENCODING)
+
+    SEND_REGEX = re.compile(r'(\w+):\s+(.*)')
+    ADD_FRIEND_REGEX = re.compile(r'ADD\s+(\w+)\s*')
+    DELETE_FRIEND_REGEX = re.compile(r'DELETE\s+(\w+)\s*')
+    STATUS_REGEX = re.compile(r'STATUS\s*')
+    HELP_REGEX = re.compile(r'HELP\s*')
+    EXIT_REGEX = re.compile(r'EXIT\s*')
+
+    def __init__(self, online_dict: dict, client_sock: socket.socket, username: str):
+        self.online_dict = online_dict
+        self.client_sock = client_sock
+        self.username = username
+        self.msg_queue = queue.Queue(QUEUE_SIZE)
+
+        self.load_msg()
+
+    def load_msg(self) -> None:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """ SELECT body
+                        FROM messages
+                        WHERE addressee = (
+                            SELECT user_id FROM users WHERE username = (?)
+                        )
+                        ORDER BY message_id ASC; """,
+                    (self.username,)
+                )
+                query_result = cursor.fetchall()
+
+                for msg in query_result:
+                    msg_body, = msg
+                    self.msg_queue.put(Message(msg_body))
+
+                cursor.execute(
+                    """ DELETE FROM messages
+                        WHERE addressee = (
+                            SELECT user_id FROM users WHERE username = (?)
+                        ); """,
+                    (self.username,)
+                )
+                conn.commit()
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f'Cannot put msg to queue in user {self.username}. Error: {e}')
+
+    def send_msg(self, msg_body: str, final_msg: bool = False) -> None:
+        self.msg_queue.put(Message(msg_body, final_msg))
+
+    def _sending_thread(self) -> None:
+        try:
+            msg = self.msg_queue.get()
+
+            while not msg.is_final():
+                self.client_sock.sendall(msg.get_body())
+                msg = self.msg_queue.get()
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f'Error in sending thread of {self.username}. Error: {e}')
+
+        finally:
+            self.client_sock.close()
+
+    def _receiving_thread(self) -> None:
+        try:
+            finish = False
+            while not finish:
+                msg = self.client_sock.recv(BUFF_SIZE).decode(ENCODING)
+
+                if msg == '':
+                    raise RuntimeError('Socket connection broken')
+
+                finish = self._handle_msg(msg)
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f'Error in recv thread of {self.username}. Error: {e}')
+            self.msg_queue.put(Message('', True))
+
+        finally:
+            self.client_sock.close()
+
+    def _handle_msg(self, msg: str) -> bool:
+        # send msg to user
+        match = self.SEND_REGEX.fullmatch(msg)
+        if match:
+            addressee, msg = match.groups()
+            self._send_msg_to(addressee, msg)
+            return False
+
+        # add friend
+        match = self.ADD_FRIEND_REGEXd.fullmatch(msg)
+        if match:
+            friend_name, = match.groups()
+            self._add_friend(friend_name)
+            return False
+
+        # delete friend
+        match = self.DELETE_FRIEND_REGEX.fullmatch(msg)
+        if match:
+            friend_name, = match.groups()
+            self._delete_friend(friend_name)
+            return False
+
+        # check status (are firends online)
+        match = self.STATUS_REGEX.fullmatch(msg)
+        if match:
+            self._check_status()
+            return False
+
+        # help
+        match = self.HELP_REGEX.fullmatch(msg)
+        if match:
+            self._send_help()
+            return False
+
+        # exit
+        match = self.EXIT_REGEX.fullmatch(msg)
+        if match:
+            self._exit()
+            return True
+
+        # unknown command
+        msg = "Unknown command. Type 'HELP' to show avaiable commands!\n"
+        self.send_msg(msg)
+        return False
+
+    def _send_msg_to(self, addressee: str, msg_body: str) -> None:
+        pass
+
+    def _add_friend(self, friend_name: str) -> None:
+        pass
+
+    def _delete_friend(self, friend_name: str) -> None:
+        pass
+
+    def _check_status(self) -> None:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """ SELECT username FROM users 
+                        WHERE user_id = (
+                            SELECT user2 FROM friends
+                            WHERE user1 = (
+                                SELECT user_id FROM user WHERE username = (?)
+                            )
+                        ); """,
+                    self.username
+                )
+                query_result = cursor.fetchall()
+
+                msg = 'Friends statuses:\n'
+                for result in query_result:
+                    friend, = result
+                    if friend in self.online_dict:
+                        msg += '*\t' + friend + '.\tSTATUS: ONLINE\n'
+                    else:
+                        msg += '*\t' + friend + '.\tSTATUS: OFFLINE\n'
+
+                self.send_msg(msg)
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f'Error while sending statuses to {self.username}. Error: {e}')
+
+    def _send_help(self) -> None:
+        pass
+
+    def _exit(self) -> None:
         pass
 
 
 class Server:
+    HELP_MSG = "HELP".encode(ENCODING)
+
     REGISTER_REGEX = re.compile(r'REGISTER\s+(\w+)\s+(\S+)\s*')
     LOGIN_REGEX = re.compile(r'LOGIN\s+(\w+)\s+(\S+)\s*')
     HELP_REGEX = re.compile(r'HELP\s*')
@@ -34,6 +222,7 @@ class Server:
     def __init__(self, PORT: int, nConnections: int):
         self.PORT = PORT
         self.nConnections = nConnections
+        self.online = {}
 
         self.logging_init()
         self.db_init()
@@ -43,14 +232,14 @@ class Server:
             self.accept_conn()
 
         except KeyboardInterrupt:
-            logging.error('Keyboard interrupt detected...\nShutting down...')
-            self.close_server()
+            logging.error('Keyboard interrupt detected... Shutting down...')
 
         finally:
-            os.sys.exit(KEYBOARD_ERROR)
+            self.close_server()
 
-    def close_server(self, ERROR_CODE=None):
+    def close_server(self):
         logging.info('Closing socket...')
+        self.server_socket.shutdown(socket.SHUT_RDWR)
         self.server_socket.close()
 
     def logging_init(self) -> None:
@@ -125,17 +314,30 @@ class Server:
 
     def handle_conn(self, client_sock: socket.socket) -> None:
         try:
+            client_address = client_sock.getsockname()
             client = self.client_init(client_sock)
 
             if client:
-                th_send = threading.Thread()
-                th_recv = threading.Thread()
+                self.online[client.username] = client
+                th_send = threading.Thread(target=client._sending_thread)
+                th_recv = threading.Thread(target=client._receiving_thread)
                 th_send.start()
                 th_recv.start()
                 th_send.join()
                 th_recv.join()
 
+                del self.online[client.username]
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(f'Error occured: {e}')
+
         finally:
+            if client:
+                logging.info(
+                    f'{client_address} has been disconnected...')
+                if client.username in self.online:
+                    del self.online[client.username]
             client_sock.close()
 
     def client_init(self, client_sock: socket.socket) -> Client:
@@ -196,18 +398,56 @@ class Server:
                 )
                 conn.commit()
                 logging.info(f'Registered {username}')
-                return None
+
+                msg = "You've been successfully registered and logged in!\n".encode(
+                    ENCODING)
+                client_sock.sendall(msg)
+                return Client(self.online, client_sock, username)
 
         except sqlite3.IntegrityError as e:
-            traceback.print_exc()
-            logging.error(f"Error while registering new client: {e}")
+            msg = "Username already in use. Try different one.".encode(
+                ENCODING)
+            client_sock.sendall(msg)
             return None
 
     def login_client(self, client_sock: socket.socket, username: str, password: str) -> Client:
-        pass
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """ SELECT password FROM users 
+                        WHERE username = (?); """,
+                    (username,)
+                )
+                query_result = cursor.fetchall()
+
+                if query_result:
+                    query_password, = query_result[0]
+                    if password == query_password:
+                        # correct login
+                        msg = "You've been logged in\n".encode(ENCODING)
+                        client_sock.sendall(msg)
+                        return Client(self.online, client_sock, username)
+
+                    else:
+                        # wrong pass
+                        msg = "Wrong password! Try again!\n".encode(ENCODING)
+                        client_sock.sendall(msg)
+
+                else:
+                    # unknow user
+                    msg = "Wrong username! Try again!\n".encode(ENCODING)
+                    client_sock.sendall(msg)
+
+                return None
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error('Error: {e}')
+            return None
 
     def send_help(self, client_sock: socket.socket) -> None:
-        pass
+        client_sock.sendall(self.HELP_MSG)
 
     def exit_client(self, client_sock: socket.socket) -> None:
         exit_mgs = "You're being disconnected from server...\n".encode(
