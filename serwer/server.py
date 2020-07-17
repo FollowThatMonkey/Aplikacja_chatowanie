@@ -252,35 +252,44 @@ class Client:
             with sqlite3.connect(DB_PATH) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """ SELECT username FROM users
-                        WHERE user_id = (
-                            SELECT user2 FROM friends
-                            WHERE user1 = (
-                                SELECT user_id FROM users WHERE username = (?)
-                            )
-                            AND user2 = (
-                                SELECT user_id FROM users WHERE username = (?)
-                            )
-                        ); """,
-                    (self.username, friend_name)
+                    """ SELECT user_id FROM users
+                        WHERE username = (?); """,
+                    (friend_name,)
                 )
                 query_result = cursor.fetchall()
-
-                if not query_result:
+                if query_result:
+                    friend_id, = query_result[0]
                     cursor.execute(
-                        """ INSERT INTO friends(user1, user2) VALUES
-                            ((
-                                SELECT user_id FROM users WHERE username = (?)
-                            ), (
-                                SELECT user_id FROM users WHERE username = (?)
-                            )); """,
-                        (self.username, friend_name)
+                        """ SELECT user_id FROM users
+                            WHERE username = (?); """,
+                        (self.username,)
                     )
-                    conn.commit()
-                    msg = f"Added {friend_name} to friends list."
+                    user_id, = cursor.fetchall()[0]
+
+                    cursor.execute(
+                        """ SELECT user1 FROM friends
+                            WHERE user1 = (?)
+                            AND user2 = (?); """,
+                        (user_id, friend_id)
+                    )
+                    query_result = cursor.fetchall()
+
+                    if not query_result:
+                        cursor.execute(
+                            """ INSERT INTO friends(user1, user2) VALUES (
+                                (?), (?)
+                            ); """,
+                            (user_id, friend_id)
+                        )
+                        conn.commit()
+                        msg = f"Added {friend_name} to friends list!"
+                    else:
+                        # you already have friends in your friends list
+                        msg = f"You already have {friend_name} in your friends list!"
 
                 else:
-                    msg = f"You already have {friend_name} in your friends list."
+                    # user 'friend' doesnt exist
+                    msg = f"User {friend_name} doesn't exist!"
 
                 self.send_msg(msg)
 
@@ -526,7 +535,7 @@ class Server:
     def client_init(self, client_sock: socket.socket) -> Client:
         greeting_msg = ("Welcome to the server!\n"
                         "Register by typing 'REGISTER username password' or log in by typing 'LOGIN username password'.\n"
-                        "Antype you need help, just type 'HELP' :)\n").encode(ENCODING)
+                        "Antime you need help, just type 'HELP' :)\n").encode(ENCODING)
         client_sock.sendall(greeting_msg)
 
         while True:
