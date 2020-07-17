@@ -30,9 +30,15 @@ class Message:
 
 
 class Client:
-    HELP_MSG = "HELP".encode(ENCODING)
+    HELP_MSG = ("Avaiable commands:\n"
+                "* 'USERNAME: text' - to send message,\n"
+                "* 'ADD username' - to add user to friends list,\n"
+                "* 'DELETE username' - to remove user from friends list,\n"
+                "* 'STATUS' - to show online users,\n"
+                "* 'HELP' - to show avaiable commands,\n"
+                "* 'EXIT' - to exit from the server.\n")
 
-    SEND_REGEX = re.compile(r'(\w+):\s+(.*)')
+    SEND_REGEX = re.compile(r'(\w+):\s+(.*)', re.DOTALL)
     ADD_FRIEND_REGEX = re.compile(r'ADD\s+(\w+)\s*')
     DELETE_FRIEND_REGEX = re.compile(r'DELETE\s+(\w+)\s*')
     STATUS_REGEX = re.compile(r'STATUS\s*')
@@ -108,15 +114,13 @@ class Client:
                 if msg == '':
                     raise RuntimeError('Socket connection broken')
 
-                finish = self._handle_msg(msg)
+                finish = self._handle_msg(msg.rstrip())
 
         except Exception as e:
             traceback.print_exc()
             logging.error(
                 f'Error in recv thread of {self.username}. Error: {e}')
             self.msg_queue.put(Message('', True))
-
-        finally:
             self.client_sock.close()
 
     def _handle_msg(self, msg: str) -> bool:
@@ -128,7 +132,7 @@ class Client:
             return False
 
         # add friend
-        match = self.ADD_FRIEND_REGEXd.fullmatch(msg)
+        match = self.ADD_FRIEND_REGEX.fullmatch(msg)
         if match:
             friend_name, = match.groups()
             self._add_friend(friend_name)
@@ -160,18 +164,173 @@ class Client:
             return True
 
         # unknown command
-        msg = "Unknown command. Type 'HELP' to show avaiable commands!\n"
+        msg = "Unknown command. Type 'HELP' to show avaiable commands!"
         self.send_msg(msg)
         return False
 
     def _send_msg_to(self, addressee: str, msg_body: str) -> None:
-        pass
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """ SELECT user_id FROM users 
+                        WHERE username = (?); """,
+                    (addressee,)
+                )
+                query_result = cursor.fetchall()
+
+                if query_result:
+                    addressee_id, = query_result[0]
+                    cursor.execute(
+                        """ SELECT user_id FROM users
+                            WHERE username = (?); """,
+                        (self.username,)
+                    )
+                    user_id, = cursor.fetchall()[0]
+
+                    cursor.execute(
+                        """ SELECT user1 FROM friends
+                            WHERE user1 = (?)
+                            AND user2 = (?); """,
+                        (user_id, addressee_id)
+                    )
+                    query_result = cursor.fetchall()
+
+                    if query_result:
+                        cursor.execute(
+                            """ SELECT user1 FROM friends
+                                WHERE user1 = (?)
+                                AND user2 = (?); """,
+                            (addressee_id, user_id)
+                        )
+                        query_result = cursor.fetchall()
+
+                        if query_result:
+                            # check if addressee is online and send msg
+                            msg = self.username + ': ' + msg_body
+                            if addressee in self.online_dict:
+                                # send msg
+                                self.online_dict[addressee].send_msg(msg)
+                                logging.info(
+                                    f"{self.username} sent message to {addressee}...")
+
+                            else:
+                                # addressee is offline
+                                self.send_msg(
+                                    f"{addressee} is offline. Adding msg to his queue!")
+                                # add msg to his queue
+                                cursor.execute(
+                                    """ INSERT INTO messages(body, addressee) VALUES (
+                                        (?), (?)
+                                    ); """,
+                                    (msg, addressee_id)
+                                )
+                                conn.commit()
+
+                        else:
+                            # addressee doesnt have you in friends list
+                            self.send_msg(
+                                f"{addressee} doesn't have you in his friends list! Cannot send message!")
+
+                    else:
+                        # you don't have addressee in friends list
+                        self.send_msg(
+                            f"You don't have {addressee} in your friends list! Cannot send message!")
+
+                else:
+                    # addressee doesn't exist
+                    self.send_msg(
+                        f"User {addressee} doesn't exist! Try again!")
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f"Error while sending message from {self.username} to {addressee}. Error: {e}")
 
     def _add_friend(self, friend_name: str) -> None:
-        pass
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """ SELECT username FROM users
+                        WHERE user_id = (
+                            SELECT user2 FROM friends
+                            WHERE user1 = (
+                                SELECT user_id FROM users WHERE username = (?)
+                            )
+                            AND user2 = (
+                                SELECT user_id FROM users WHERE username = (?)
+                            )
+                        ); """,
+                    (self.username, friend_name)
+                )
+                query_result = cursor.fetchall()
+
+                if not query_result:
+                    cursor.execute(
+                        """ INSERT INTO friends(user1, user2) VALUES
+                            ((
+                                SELECT user_id FROM users WHERE username = (?)
+                            ), (
+                                SELECT user_id FROM users WHERE username = (?)
+                            )); """,
+                        (self.username, friend_name)
+                    )
+                    conn.commit()
+                    msg = f"Added {friend_name} to friends list."
+
+                else:
+                    msg = f"You already have {friend_name} in your friends list."
+
+                self.send_msg(msg)
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f"Error while adding new friend to {self.username} friends list. Error: {e}")
 
     def _delete_friend(self, friend_name: str) -> None:
-        pass
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """ SELECT username FROM users
+                        WHERE user_id = (
+                            SELECT user2 FROM friends
+                            WHERE user1 = (
+                                SELECT user_id FROM users WHERE username = (?)
+                            )
+                            AND user2 = (
+                                SELECT user_id FROM users WHERE username = (?)
+                            )
+                        ); """,
+                    (self.username, friend_name)
+                )
+                query_result = cursor.fetchall()
+
+                if query_result:
+                    cursor.execute(
+                        """ DELETE FROM friends
+                            WHERE user1 = (
+                                SELECT user_id FROM users WHERE username = (?)
+                            )
+                            AND user2 = (
+                                SELECT user_id FROM users WHERE username = (?)
+                            ); """,
+                        (self.username, friend_name)
+                    )
+                    conn.commit()
+                    msg = f"Deleted {friend_name} from friends."
+
+                else:
+                    msg = f"You don't have {friend_name} in your friends list."
+
+                self.send_msg(msg)
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f"Error while deleting friend of {self.username}. Error: {e}")
 
     def _check_status(self) -> None:
         try:
@@ -182,10 +341,10 @@ class Client:
                         WHERE user_id = (
                             SELECT user2 FROM friends
                             WHERE user1 = (
-                                SELECT user_id FROM user WHERE username = (?)
+                                SELECT user_id FROM users WHERE username = (?)
                             )
                         ); """,
-                    self.username
+                    (self.username,)
                 )
                 query_result = cursor.fetchall()
 
@@ -193,9 +352,9 @@ class Client:
                 for result in query_result:
                     friend, = result
                     if friend in self.online_dict:
-                        msg += '*\t' + friend + '.\tSTATUS: ONLINE\n'
+                        msg += '*\t' + friend + '\tSTATUS: ONLINE\n'
                     else:
-                        msg += '*\t' + friend + '.\tSTATUS: OFFLINE\n'
+                        msg += '*\t' + friend + '\tSTATUS: OFFLINE\n'
 
                 self.send_msg(msg)
 
@@ -205,14 +364,37 @@ class Client:
                 f'Error while sending statuses to {self.username}. Error: {e}')
 
     def _send_help(self) -> None:
-        pass
+        try:
+            self.send_msg(self.HELP_MSG)
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(
+                f'Error while sending help msg to {self.username}. Error: {e}')
 
     def _exit(self) -> None:
-        pass
+        try:
+            msg = 'Exiting from the server.\n'
+            self.send_msg(msg)
+            self.send_msg('', True)
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(f'Error while exiting {self.username}. Error: {e}')
+
+            self.client_sock.close()
+
+        finally:
+            if self.username in self.online_dict:
+                del self.online_dict[self.username]
 
 
 class Server:
-    HELP_MSG = "HELP".encode(ENCODING)
+    HELP_MSG = ("Avaiable commands:\n"
+                "* 'REGISTER username password' - to register to the server,\n"
+                "* 'LOGIN username password' - to log in to the server,\n"
+                "* 'HELP' - to show avaiable commands,\n"
+                "* 'EXIT' - to exit from the server.\n").encode(ENCODING)
 
     REGISTER_REGEX = re.compile(r'REGISTER\s+(\w+)\s+(\S+)\s*')
     LOGIN_REGEX = re.compile(r'LOGIN\s+(\w+)\s+(\S+)\s*')
@@ -260,7 +442,7 @@ class Server:
                     ); """
                 )
                 cursor.execute(
-                    """ CREATE TABLE IF NOT EXISTS firends(
+                    """ CREATE TABLE IF NOT EXISTS friends(
                         user1 INTEGER,
                         user2 INTEGER,
                         CONSTRAINT fk_column
@@ -326,7 +508,8 @@ class Server:
                 th_send.join()
                 th_recv.join()
 
-                del self.online[client.username]
+                if client.username in self.online:
+                    del self.online[client.username]
 
         except Exception as e:
             traceback.print_exc()
